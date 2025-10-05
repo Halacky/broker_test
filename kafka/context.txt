@@ -1,0 +1,588 @@
+file path: /home/kirill/projects/folium/broker_stand/src/project/main_pp.py
+```
+from queue_manager import QueueManager
+from data_collector import DataCollector
+from data_proccesor import DataProcessor
+from data_source import RedisStreamSource, KafkaTopicSource
+from typing import Any, Dict, Optional, List
+import asyncio
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+class Pipeline:
+    
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.queue_manager = QueueManager(
+            max_queue_size=config.get('max_queue_size', 1000)
+        )
+        self.collector = DataCollector(self.queue_manager)
+        self.processor = DataProcessor(self.queue_manager)
+        self.tasks: List[asyncio.Task] = []
+    
+    def setup_sources(self):
+        redis_config = self.config.get('redis', {})
+        kafka_config = self.config.get('kafka', {})
+        
+        redis_1 = RedisStreamSource(
+            "redis_chanel_1per3sec",
+            stream_key=redis_config.get('stream_1', 'stream:1per3sec'),
+            redis_url=redis_config.get('url', 'redis://localhost:6379')
+        )
+        
+        redis_2 = RedisStreamSource(
+            "redis_chanel_1per30sec",
+            stream_key=redis_config.get('stream_2', 'stream:1per30sec'),
+            redis_url=redis_config.get('url', 'redis://localhost:6379')
+        )
+        
+        kafka_fast = KafkaTopicSource(
+            "kafka_topic_1per0_25sec",
+            topic=kafka_config.get('topic_fast', 'topic_0_25sec'),
+            bootstrap_servers=kafka_config.get('bootstrap_servers', 'localhost:9092'),
+            extract_id=True,
+            id_field=kafka_config.get('id_field', 'id')
+        )
+        
+        kafka_1 = KafkaTopicSource(
+            "kafka_topic_1per30sec",
+            topic=kafka_config.get('topic_1', 'topic_30sec'),
+            bootstrap_servers=kafka_config.get('bootstrap_servers', 'localhost:9092')
+        )
+        
+        kafka_2 = KafkaTopicSource(
+            "kafka_topic_1per25min",
+            topic=kafka_config.get('topic_2', 'topic_25min'),
+            bootstrap_servers=kafka_config.get('bootstrap_servers', 'localhost:9092')
+        )
+        
+        kafka_3 = KafkaTopicSource(
+            "kafka_topic_1per30min",
+            topic=kafka_config.get('topic_3', 'topic_30min'),
+            bootstrap_servers=kafka_config.get('bootstrap_servers', 'localhost:9092')
+        )
+        
+        self.collector.register_source(redis_1, use_dict_queue=False)
+        self.collector.register_source(redis_2, use_dict_queue=False)
+        self.collector.register_source(kafka_fast, use_dict_queue=True)  # С ID
+        self.collector.register_source(kafka_1, use_dict_queue=False)
+        self.collector.register_source(kafka_2, use_dict_queue=False)
+        self.collector.register_source(kafka_3, use_dict_queue=False)
+    
+    async def monitoring_task(self):
+        try:
+            while True:
+                await asyncio.sleep(10)
+                sizes = self.queue_manager.get_queue_sizes()
+                logger.info(f"Размеры очередей: {sizes}")
+        except asyncio.CancelledError:
+            logger.info("Мониторинг остановлен")
+    
+    async def run(self):
+        logger.info("Запуск пайплайна...")
+        
+        self.setup_sources()
+        
+        try:
+            for source_name in self.collector.sources.keys():
+                task = asyncio.create_task(
+                    self.collector.collect_from_source(source_name),
+                    name=f"collector_{source_name}"
+                )
+                self.tasks.append(task)
+            
+            process_task = asyncio.create_task(
+                self.processor.process_messages(),
+                name="processor"
+            )
+            self.tasks.append(process_task)
+            
+            monitor_task = asyncio.create_task(
+                self.monitoring_task(),
+                name="monitor"
+            )
+            self.tasks.append(monitor_task)
+            
+            logger.info(f"Пайплайн запущен. Активных задач: {len(self.tasks)}")
+            
+            await asyncio.gather(*self.tasks)
+            
+        except Exception as e:
+            logger.error(f"Критическая ошибка в пайплайне: {e}", exc_info=True)
+            raise
+    
+    async def shutdown(self):
+        logger.info("Остановка пайплайна...")
+        
+        self.processor.stop()
+        
+        for source in self.collector.sources.values():
+            source._running = False
+        
+        for task in self.tasks:
+            if not task.done():
+                task.cancel()
+        
+        await asyncio.gather(*self.tasks, return_exceptions=True)
+        
+        logger.info("Пайплайн остановлен")
+```
+
+file path: /home/kirill/projects/folium/broker_stand/src/project/data_proccesor.py
+```
+from typing import Optional
+import asyncio
+import logging
+from datetime import datetime
+from queue_manager import QueueManager
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+class DataProcessor:
+    def __init__(self, queue_manager: QueueManager):
+        self.queue_manager = queue_manager
+        self.primary_source = "redis_chanel_1per3sec"
+        self.fast_kafka_source = "kafka_topic_1per0_25sec"
+        self._running = False
+    
+    def find_closest_message(self, target_msg, msg_id: str):
+        dict_queues = self.queue_manager.dict_queues.get(self.fast_kafka_source, {})
+        
+        if msg_id not in dict_queues or not dict_queues[msg_id]:
+            return None
+        
+        queue = dict_queues[msg_id]
+        target_time = target_msg.timestamp
+        closest = None
+        min_diff = None
+        
+        for msg in queue:
+            diff = abs((msg.timestamp - target_time).total_seconds())
+            if min_diff is None or diff < min_diff:
+                min_diff = diff
+                closest = msg
+        
+        return closest
+    
+    def cleanup_old_messages(self, msg_id: str, target_message):
+        dict_queues = self.queue_manager.dict_queues.get(self.fast_kafka_source, {})
+        
+        if msg_id not in dict_queues:
+            return
+        
+        queue = dict_queues[msg_id]
+        target_time = target_message.timestamp
+        
+        removed_count = 0
+        while queue and queue[0].timestamp < target_time:
+            queue.popleft()
+            removed_count += 1
+        
+        if removed_count > 0:
+            logger.debug(f"Удалено {removed_count} старых сообщений для ID {msg_id}")
+    
+    async def process_messages(self):
+        self._running = True
+        
+        while self._running:
+            try:
+                primary_queue = self.queue_manager.simple_queues.get(self.primary_source)
+                
+                if not primary_queue:
+                    await asyncio.sleep(0.1)
+                    continue
+                
+                while primary_queue:
+                    primary_msg = primary_queue.popleft()
+                    
+                    target_id = self._extract_target_id(primary_msg)
+                    
+                    if not target_id:
+                        logger.warning(f"Не удалось извлечь ID из сообщения {primary_msg.source}")
+                        continue
+                    
+                    closest = self.find_closest_message(primary_msg, target_id)
+                    
+                    if closest:
+                        time_diff = abs((closest.timestamp - primary_msg.timestamp).total_seconds())
+                        logger.info(
+                            f"Найдено соответствие для {primary_msg.timestamp}: "
+                            f"{closest.timestamp} (ID: {target_id}, разница: {time_diff:.3f}s)"
+                        )
+                        
+                        self.cleanup_old_messages(target_id, closest)
+                        
+                        await self._process_matched_pair(primary_msg, closest)
+                    else:
+                        logger.warning(f"Не найдено соответствие для ID {target_id}")
+                
+                await asyncio.sleep(0.1)
+                
+            except asyncio.CancelledError:
+                logger.info("Обработка сообщений остановлена")
+                break
+            except Exception as e:
+                logger.error(f"Ошибка при обработке: {e}", exc_info=True)
+                await asyncio.sleep(1)
+    
+    def _extract_target_id(self, message) -> Optional[str]:
+        if isinstance(message.data, dict):
+            return message.data.get('target_id', 'default_id')
+        return 'default_id'
+    
+    async def _process_matched_pair(self, primary_msg, matched_msg):
+        pass
+    
+    def stop(self):
+        self._running = False
+
+
+```
+
+file path: /home/kirill/projects/folium/broker_stand/src/project/data_source.py
+```
+from abc import ABC, abstractmethod
+from datetime import datetime
+import json
+import asyncio
+import logging
+import redis.asyncio as aioredis
+from aiokafka import AIOKafkaConsumer
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+class DataSource(ABC):
+    
+    def __init__(self, name: str):
+        self.name = name
+        self._running = False
+    
+    @abstractmethod
+    async def connect(self):
+        pass
+    
+    @abstractmethod
+    async def disconnect(self):
+        pass
+    
+    @abstractmethod
+    async def consume(self):
+        pass
+
+
+class RedisStreamSource(DataSource):
+    def __init__(
+        self, 
+        name: str, 
+        stream_key: str,
+        redis_url: str = "redis://localhost:6379",
+        block_ms: int = 1000
+    ):
+        super().__init__(name)
+        self.stream_key = stream_key
+        self.redis_url = redis_url
+        self.block_ms = block_ms
+        self.client = None
+        self.last_id = '0'
+    
+    async def connect(self):
+        try:
+            self.client = await aioredis.from_url(
+                self.redis_url,
+                encoding="utf-8",
+                decode_responses=True
+            )
+            logger.info(f"Подключено к Redis для {self.name}")
+            self._running = True
+        except Exception as e:
+            logger.error(f"Ошибка подключения к Redis для {self.name}: {e}")
+            raise
+    
+    async def disconnect(self):
+        if self.client:
+            await self.client.close()
+            self._running = False
+            logger.info(f"Отключено от Redis для {self.name}")
+    
+    async def consume(self):
+        if not self.client:
+            raise RuntimeError(f"Redis client не подключен для {self.name}")
+        
+        try:
+            response = await self.client.xread(
+                {self.stream_key: self.last_id},
+                block=self.block_ms,
+                count=1
+            )
+            
+            if response:
+                stream_name, messages = response[0]
+                if messages:
+                    msg_id, msg_data = messages[0]
+                    self.last_id = msg_id
+                    
+                    # Парсинг данных
+                    return {
+                        "timestamp": datetime.now(),
+                        "data": msg_data,
+                        "source": self.name
+                    }
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Ошибка чтения из Redis {self.name}: {e}")
+            raise
+
+
+class KafkaTopicSource(DataSource):
+    def __init__(
+        self,
+        name: str,
+        topic: str,
+        bootstrap_servers: str = "localhost:9092",
+        group_id: str = None,
+        extract_id: bool = False,
+        id_field: str = "id"
+    ):
+        super().__init__(name)
+        self.topic = topic
+        self.bootstrap_servers = bootstrap_servers
+        self.group_id = group_id or f"{name}_group"
+        self.extract_id = extract_id
+        self.id_field = id_field
+        self.consumer = None
+    
+    async def connect(self):
+        try:
+            self.consumer = AIOKafkaConsumer(
+                self.topic,
+                bootstrap_servers=self.bootstrap_servers,
+                group_id=self.group_id,
+                enable_auto_commit=True,
+                auto_offset_reset='latest',  # или 'earliest'
+                value_deserializer=lambda m: json.loads(m.decode('utf-8'))
+            )
+            await self.consumer.start()
+            logger.info(f"Подключено к Kafka топику {self.topic} для {self.name}")
+            self._running = True
+        except Exception as e:
+            logger.error(f"Ошибка подключения к Kafka для {self.name}: {e}")
+            raise
+    
+    async def disconnect(self):
+        if self.consumer:
+            await self.consumer.stop()
+            self._running = False
+            logger.info(f"Отключено от Kafka для {self.name}")
+    
+    async def consume(self):
+        if not self.consumer:
+            raise RuntimeError(f"Kafka consumer не подключен для {self.name}")
+        
+        try:
+            msg = await asyncio.wait_for(
+                self.consumer.__anext__(),
+                timeout=1.0
+            )
+            
+            data = msg.value
+            msg_id = None
+            
+            if self.extract_id and isinstance(data, dict):
+                msg_id = data.get(self.id_field)
+            
+            return {
+                "timestamp": datetime.fromtimestamp(msg.timestamp / 1000.0),
+                "data": data,
+                "source": self.name,
+                "id": msg_id
+            }
+            
+        except asyncio.TimeoutError:
+            return None
+        except Exception as e:
+            logger.error(f"Ошибка чтения из Kafka {self.name}: {e}")
+            raise
+
+```
+
+file path: /home/kirill/projects/folium/broker_stand/src/project/queue_manager.py
+```
+from typing import Dict
+from collections import deque
+import logging
+
+logger = logging.getLogger(__name__)
+
+class QueueManager:
+    def __init__(self, max_queue_size: int = 10000):
+        self.simple_queues: Dict[str, deque] = {}
+        self.dict_queues: Dict[str, Dict[str, deque]] = {}
+        self.max_queue_size = max_queue_size
+    
+    def create_simple_queue(self, source_name: str):
+        if source_name not in self.simple_queues:
+            self.simple_queues[source_name] = deque(maxlen=self.max_queue_size)
+            logger.info(f"Создана очередь для {source_name}")
+    
+    def create_dict_queue(self, source_name: str):
+        if source_name not in self.dict_queues:
+            self.dict_queues[source_name] = {}
+            logger.info(f"Создан словарь очередей для {source_name}")
+    
+    def add_to_simple_queue(self, source_name: str, message):
+        if source_name not in self.simple_queues:
+            self.create_simple_queue(source_name)
+        self.simple_queues[source_name].append(message)
+    
+    def add_to_dict_queue(self, source_name: str, message):
+        if source_name not in self.dict_queues:
+            self.create_dict_queue(source_name)
+        
+        msg_id = message.id
+        if msg_id is None:
+            logger.warning(f"Сообщение без ID из {source_name}, пропускаем")
+            return
+        
+        if msg_id not in self.dict_queues[source_name]:
+            self.dict_queues[source_name][msg_id] = deque(maxlen=self.max_queue_size)
+        
+        self.dict_queues[source_name][msg_id].append(message)
+    
+    def get_queue_sizes(self) -> Dict[str, int]:
+        sizes = {}
+        for name, queue in self.simple_queues.items():
+            sizes[name] = len(queue)
+        
+        for name, dict_queue in self.dict_queues.items():
+            total = sum(len(q) for q in dict_queue.values())
+            sizes[f"{name}_total"] = total
+            sizes[f"{name}_ids"] = len(dict_queue)
+        
+        return sizes
+
+```
+
+file path: /home/kirill/projects/folium/broker_stand/src/project/main.py
+```
+import logging
+from main_pp import Pipeline
+import asyncio
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+async def main():
+    
+    config = {
+        'max_queue_size': 1000,
+        'redis': {
+            'url': 'redis://localhost:6379',
+            'stream_1': 'stream:1per3sec',
+            'stream_2': 'stream:1per30sec',
+        },
+        'kafka': {
+            'bootstrap_servers': 'localhost:9092',
+            'topic_fast': 'topic_0_25sec',
+            'topic_1': 'topic_30sec',
+            'topic_2': 'topic_25min',
+            'topic_3': 'topic_30min',
+            'id_field': 'id'
+        }
+    }
+    
+    pipeline = Pipeline(config)
+    
+    try:
+        await pipeline.run()
+    except KeyboardInterrupt:
+        logger.info("Получен сигнал прерывания")
+    finally:
+        await pipeline.shutdown()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+file path: /home/kirill/projects/folium/broker_stand/src/project/data_collector.py
+```
+from typing import Dict
+import asyncio
+import logging
+
+from queue_manager import QueueManager
+from data_source import DataSource
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+class DataCollector:
+    
+    def __init__(self, queue_manager: QueueManager):
+        self.queue_manager = queue_manager
+        self.sources: Dict[str, DataSource] = {}
+        self.source_configs: Dict[str, bool] = {}
+    
+    def register_source(self, source: DataSource, use_dict_queue: bool = False):
+        self.sources[source.name] = source
+        self.source_configs[source.name] = use_dict_queue
+        
+        if use_dict_queue:
+            self.queue_manager.create_dict_queue(source.name)
+        else:
+            self.queue_manager.create_simple_queue(source.name)
+    
+    async def collect_from_source(self, source_name: str):
+        source = self.sources[source_name]
+        use_dict_queue = self.source_configs[source_name]
+        
+        await source.connect()
+        
+        try:
+            while source._running:
+                try:
+                    message = await source.consume()
+                    
+                    if message is None:
+                        await asyncio.sleep(0.01)
+                        continue
+                    
+                    if use_dict_queue:
+                        self.queue_manager.add_to_dict_queue(source_name, message)
+                    else:
+                        self.queue_manager.add_to_simple_queue(source_name, message)
+                    
+                    logger.debug(f"Получено сообщение из {source_name}")
+                    
+                except asyncio.CancelledError:
+                    logger.info(f"Сбор данных из {source_name} отменен")
+                    break
+                except Exception as e:
+                    logger.error(f"Ошибка при сборе из {source_name}: {e}")
+                    await asyncio.sleep(1)
+        finally:
+            await source.disconnect()
+```
+
