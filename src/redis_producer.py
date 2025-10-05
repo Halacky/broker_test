@@ -12,7 +12,7 @@ def create_redis_client():
     )
     return client
 
-def send_to_stream(client, stream_name='test-stream'):
+def send_to_stream(client, stream_name='stream_1per30sec'):
     """Отправка сообщений в Redis Stream со скоростью 1 сообщение в 3 секунды"""
     message_count = 0
     interval = 3  # 3 секунды между сообщениями
@@ -27,10 +27,12 @@ def send_to_stream(client, stream_name='test-stream'):
             
             # Данные для отправки
             message_data = {
-                'message_id': str(message_count),
-                'timestamp': datetime.now().isoformat(),
-                'text': f'Сообщение номер {message_count}',
-                'data': json.dumps({'counter': message_count, 'type': 'test'})
+                "datetime": "2025-10-05T19:36:42.848947+07:00", 
+                "ids": json.dumps(["132134234"]), 
+                "truck_id": "00200001" , 
+                "new_state": 1,  
+                "area": 6, 
+                "type": "mc"
             }
             
             # Отправка в Redis Stream
@@ -44,6 +46,7 @@ def send_to_stream(client, stream_name='test-stream'):
             
             # Пауза 3 секунды
             time.sleep(interval)
+            break
             
     except KeyboardInterrupt:
         print(f"\n\nОстановка producer. Всего отправлено: {message_count} сообщений")

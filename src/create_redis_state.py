@@ -67,12 +67,12 @@ def run_producer(process_number: int):
             if not active_ids:
                 id_str = f"{process_number}_{next_sequential_id}"
                 active_ids[id_str] = {
-                    'current_state': 0,
+                    'current_state': 1,
                     'transition_count': 0,
                     'last_change_time': current_time
                 }
                 next_sequential_id += 1
-                print(f"[Процесс {process_number}] Создан новый ID: {id_str} с начальным состоянием 0.")
+                print(f"[Процесс {process_number}] Создан новый ID: {id_str} с начальным состоянием 1.")
                 time.sleep(1)
                 continue
 

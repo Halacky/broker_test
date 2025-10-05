@@ -131,11 +131,8 @@ class RedisStreamSource(DataSource):
                     # Извлекаем ID из данных Redis (если есть)
                     redis_msg_id = parsed_data.get('id')
                     
-                    # Формируем чистую структуру данных без дублирования
-                    clean_data = {
-                        'coord': parsed_data.get('coord'),
-                        'new_state': parsed_data.get('new_state')
-                    }
+                    # Формируем чистую структуру данных без дублирования ID и datetime
+                    clean_data = {k: v for k, v in parsed_data.items() if k not in ('datetime', 'id')}
                     
                     return Message(
                         timestamp=timestamp,
